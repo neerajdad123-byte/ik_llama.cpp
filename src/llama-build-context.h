@@ -409,10 +409,11 @@ struct llm_build_context {
                        bool   norm_w,
                        bool   scale_w,
                       float   w_scale,
-llm_expert_gating_func_type   gating_op,
+ llm_expert_gating_func_type   gating_op,
          const llm_build_cb & cb, int il, ggml_cgraph * graph = nullptr, bool add_input = false,
          ggml_tensor * up_gate_exps = nullptr, ggml_tensor * up_gate_exps_b = nullptr,
-         ggml_tensor * input_logits = nullptr, ggml_tensor * down_exps_s = nullptr);
+         ggml_tensor * input_logits = nullptr, ggml_tensor * down_exps_s = nullptr,
+         ggml_tensor * up_gate_exps_hot = nullptr, ggml_tensor * down_exps_hot = nullptr);
 
     static ggml_tensor * llm_build_moe_ffn(ggml_context * ctx, llama_context & lctx,
          ggml_tensor * cur,
@@ -427,10 +428,11 @@ llm_expert_gating_func_type   gating_op,
                        bool   norm_w,
                        bool   scale_w,
                       float   w_scale,
-llm_expert_gating_func_type   gating_op,
+ llm_expert_gating_func_type   gating_op,
          const llm_build_cb & cb, int il, ggml_cgraph * graph = nullptr, bool add_input = false,
          ggml_tensor * up_gate_exps = nullptr, ggml_tensor * up_gate_exps_b = nullptr,
-         ggml_tensor * input_logits = nullptr, ggml_tensor * down_exps_s = nullptr) {
+         ggml_tensor * input_logits = nullptr, ggml_tensor * down_exps_s = nullptr,
+         ggml_tensor * up_gate_exps_hot = nullptr, ggml_tensor * down_exps_hot = nullptr) {
         return llm_build_moe_ffn(ctx, lctx, cur,
                 gate_inp,   nullptr,
                 up_exps,    nullptr,
@@ -440,7 +442,7 @@ llm_expert_gating_func_type   gating_op,
                 n_expert, n_expert_used,
                 type_op, norm_w, scale_w, w_scale,
                 gating_op, cb, il, graph, add_input, up_gate_exps, up_gate_exps_b,
-                input_logits, down_exps_s);
+                input_logits, down_exps_s, up_gate_exps_hot, down_exps_hot);
     }
 
     static ggml_tensor * llm_build_std_moe_ffn(ggml_context * ctx, llama_context & lctx,

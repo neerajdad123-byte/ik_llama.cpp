@@ -4031,6 +4031,12 @@ static bool llm_load_tensors(
                     layer.ffn_up_exps->type, layer.ffn_up_exps->ne[0], layer.ffn_up_exps->ne[1], n_hot);
                 ggml_set_name(layer.ffn_up_exps_hot, make_hot_name(il, "ffn_up_exps_hot").c_str());
             }
+            // Fused up+gate (Path 1, used by Qwen3MoE, DeepSeek, etc.)
+            if (layer.ffn_up_gate_exps) {
+                layer.ffn_up_gate_exps_hot = ggml_new_tensor_3d(hot_ctx,
+                    layer.ffn_up_gate_exps->type, layer.ffn_up_gate_exps->ne[0], layer.ffn_up_gate_exps->ne[1], n_hot);
+                ggml_set_name(layer.ffn_up_gate_exps_hot, make_hot_name(il, "ffn_up_gate_exps_hot").c_str());
+            }
             if (layer.ffn_down_exps) {
                 layer.ffn_down_exps_hot = ggml_new_tensor_3d(hot_ctx,
                     layer.ffn_down_exps->type, layer.ffn_down_exps->ne[0], layer.ffn_down_exps->ne[1], n_hot);
@@ -4049,6 +4055,32 @@ static bool llm_load_tensors(
         LLAMA_LOG_INFO("%s: created hotset GPU buffer (%s, %s)\n", __func__,
             ggml_backend_buffer_name(hot_buf),
             ggml_backend_buft_name(buft_vram));
+
+        // Create hotset mask and id_map (CPU tensors, created after buffer alloc for pointer validity)
+        for (int il = 0; il < n_layer; ++il) {
+            auto & layer = model.layers[il];
+            int n_hot = (int)layer.hotset_hot_indices.size();
+            if (n_hot == 0) continue;
+
+            // Mask: 1.0 for hot experts, 0.0 for cold
+            size_t mask_sz = n_expert * sizeof(float);
+            ggml_init_params cpu_params = { .mem_size = ggml_tensor_overhead() + mask_sz*4, .mem_buffer = NULL, .no_alloc = false };
+            ggml_context * cpu_ctx = ggml_init(cpu_params);
+            model.ctxs.emplace_back(cpu_ctx);
+
+            layer.hotset_mask = ggml_new_tensor_1d(cpu_ctx, GGML_TYPE_F32, n_expert);
+            ggml_set_name(layer.hotset_mask, make_hot_name(il, "hotset_mask").c_str());
+            float * mask_data = (float *)layer.hotset_mask->data;
+            for (int e = 0; e < n_expert; e++) mask_data[e] = 0.0f;
+            for (int h = 0; h < n_hot; h++) mask_data[layer.hotset_hot_indices[h]] = 1.0f;
+
+            // ID map: remapped hot indices; cold experts map to 0
+            layer.hotset_id_map = ggml_new_tensor_1d(cpu_ctx, GGML_TYPE_I32, n_expert);
+            ggml_set_name(layer.hotset_id_map, make_hot_name(il, "hotset_id_map").c_str());
+            int32_t * id_data = (int32_t *)layer.hotset_id_map->data;
+            for (int e = 0; e < n_expert; e++) id_data[e] = 0;
+            for (int h = 0; h < n_hot; h++) id_data[layer.hotset_hot_indices[h]] = h;
+        }
     }
 
     if (llama_supports_gpu_offload()) {
@@ -4112,9 +4144,10 @@ static bool llm_load_tensors(
                 }
             };
 
-            copy_hot_experts(layer.ffn_gate_exps, layer.ffn_gate_exps_hot);
-            copy_hot_experts(layer.ffn_up_exps,   layer.ffn_up_exps_hot);
-            copy_hot_experts(layer.ffn_down_exps, layer.ffn_down_exps_hot);
+            copy_hot_experts(layer.ffn_gate_exps,    layer.ffn_gate_exps_hot);
+            copy_hot_experts(layer.ffn_up_exps,      layer.ffn_up_exps_hot);
+            copy_hot_experts(layer.ffn_up_gate_exps, layer.ffn_up_gate_exps_hot);
+            copy_hot_experts(layer.ffn_down_exps,    layer.ffn_down_exps_hot);
         }
         LLAMA_LOG_INFO("%s: hotset: copied %d hot expert shards to GPU\n", __func__, n_copied);
     }

@@ -292,9 +292,15 @@ struct llama_layer {
     struct ggml_tensor * ffn_down_exps_cold = nullptr;
     struct ggml_tensor * ffn_up_exps_hot = nullptr;
     struct ggml_tensor * ffn_up_exps_cold = nullptr;
+    struct ggml_tensor * ffn_up_gate_exps_hot = nullptr;
+    struct ggml_tensor * ffn_up_gate_exps_cold = nullptr;
 
     // hot expert indices for this layer (sorted)
     std::vector<int> hotset_hot_indices;
+
+    // hotset mask & id map (created in load_tensors, used by graph builder)
+    struct ggml_tensor * hotset_mask    = nullptr; // [n_expert] float32: 1.0 for hot, 0.0 for cold
+    struct ggml_tensor * hotset_id_map  = nullptr; // [n_expert] int32: remapped expert idx (for hot), 0 (for cold)
 
     llama_split_tensor split_ffn_gate_inp;
     llama_split_tensor split_ffn_up_exps;

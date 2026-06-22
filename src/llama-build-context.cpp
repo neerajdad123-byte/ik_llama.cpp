@@ -1031,22 +1031,23 @@ ggml_tensor * llm_build_context::llm_build_ffn(
 ggml_tensor * llm_build_context::llm_build_moe_ffn(
         ggml_context * ctx,
        llama_context & lctx,
-         ggml_tensor * cur,
-         ggml_tensor * gate_inp,   ggml_tensor * gate_inp_b,
-         ggml_tensor * up_exps,    ggml_tensor * up_exps_b,
-         ggml_tensor * gate_exps,  ggml_tensor * gate_exps_b,
-         ggml_tensor * down_exps,  ggml_tensor * down_exps_b,
-         ggml_tensor * exp_probs_b,
-                    int64_t   n_expert,
-                    int64_t   n_expert_used,
-            llm_ffn_op_type   type_op,
-                       bool   norm_w,
-                       bool   scale_w,
-                      float   w_scale,
-llm_expert_gating_func_type   gating_op,
-         const llm_build_cb & cb, int il, ggml_cgraph * graph, bool add_input,
-         ggml_tensor * up_gate_exps, ggml_tensor * up_gate_exps_b,
-         ggml_tensor * input_logits, ggml_tensor * down_exps_s) {
+          ggml_tensor * cur,
+          ggml_tensor * gate_inp,   ggml_tensor * gate_inp_b,
+          ggml_tensor * up_exps,    ggml_tensor * up_exps_b,
+          ggml_tensor * gate_exps,  ggml_tensor * gate_exps_b,
+          ggml_tensor * down_exps,  ggml_tensor * down_exps_b,
+          ggml_tensor * exp_probs_b,
+                     int64_t   n_expert,
+                     int64_t   n_expert_used,
+             llm_ffn_op_type   type_op,
+                        bool   norm_w,
+                        bool   scale_w,
+                       float   w_scale,
+ llm_expert_gating_func_type   gating_op,
+          const llm_build_cb & cb, int il, ggml_cgraph * graph, bool add_input,
+          ggml_tensor * up_gate_exps, ggml_tensor * up_gate_exps_b,
+          ggml_tensor * input_logits, ggml_tensor * down_exps_s,
+          ggml_tensor * up_gate_exps_hot, ggml_tensor * down_exps_hot) {
 
     GGML_ASSERT(gate_inp || input_logits);
 
@@ -1159,6 +1160,55 @@ llm_expert_gating_func_type   gating_op,
         cb(cur, "ffn_moe_weighted", il);
     }
 
+    // Check if hotset is active for this layer
+    bool use_hotset = up_gate_exps_hot && down_exps_hot && lctx.model.layers[il].hotset_mask;
+    ggml_tensor * experts;
+    if (use_hotset) {
+        // Hotset dual-path: hot experts use GPU sub-tensors, cold experts use CPU originals
+        // Build hot_mask and remapped IDs for selected experts
+        ggml_tensor * hot_mask_rows = ggml_get_rows(ctx, lctx.model.layers[il].hotset_mask, selected_experts); // [n_expert_used, n_tokens]
+        cb(hot_mask_rows, "ffn_moe_hot_mask", il);
+        ggml_tensor * hot_ids = ggml_get_rows(ctx, lctx.model.layers[il].hotset_id_map, selected_experts); // [n_expert_used, n_tokens] (int32)
+        cb(hot_ids, "ffn_moe_hot_ids", il);
+
+        // cold_mask = 1 - hot_mask
+        ggml_tensor * cold_mask_rows = ggml_add(ctx, ggml_neg(ctx, hot_mask_rows), ggml_new_f32(ctx, 1.0f));
+        cb(cold_mask_rows, "ffn_moe_cold_mask", il);
+
+        // Reshape masks for broadcasting: [n_expert_used, n_tokens] -> [1, n_expert_used, n_tokens]
+        ggml_tensor * mask_3d = ggml_reshape_3d(ctx, hot_mask_rows, 1, n_expert_used, n_tokens);
+        ggml_tensor * cmask_3d = ggml_reshape_3d(ctx, cold_mask_rows, 1, n_expert_used, n_tokens);
+
+        // Hot path: up+gate on GPU hot sub-tensor with remapped IDs
+        ggml_tensor * par_hot = ggml_moe_up_gate_ext(ctx, up_gate_exps_hot, nullptr, cur, hot_ids, nullptr, nullptr,
+                type_op == LLM_FFN_SILU ? GGML_UNARY_OP_SILU :
+                type_op == LLM_FFN_GELU ? GGML_UNARY_OP_GELU : GGML_UNARY_OP_SWIGLU_OAI);
+        cb(par_hot, "ffn_moe_hot_par", il);
+
+        // Cold path: up+gate on CPU original tensor with same IDs
+        ggml_tensor * par_cold = ggml_moe_up_gate_ext(ctx, up_gate_exps, nullptr, cur, selected_experts, nullptr, nullptr,
+                type_op == LLM_FFN_SILU ? GGML_UNARY_OP_SILU :
+                type_op == LLM_FFN_GELU ? GGML_UNARY_OP_GELU : GGML_UNARY_OP_SWIGLU_OAI);
+        cb(par_cold, "ffn_moe_cold_par", il);
+
+        // Mask and combine: par = par_hot * mask + par_cold * (1-mask)
+        // mask broadcast: [1, n_expert_used, n_tokens] over [2*n_ff, n_expert_used, n_tokens]
+        ggml_tensor * par = ggml_add(ctx,
+            ggml_mul(ctx, par_hot, mask_3d),
+            ggml_mul(ctx, par_cold, cmask_3d));
+        cb(par, "ffn_moe_gate_par", il);
+
+        // Down projection (hot + cold paths)
+        ggml_tensor * experts_hot = llm_build_lora_mm_id(lctx, ctx, down_exps_hot, par, hot_ids);
+        ggml_tensor * experts_cold = llm_build_lora_mm_id(lctx, ctx, down_exps, par, selected_experts);
+
+        // Mask and combine: shape [n_embd, n_expert_used, n_tokens]
+        experts = ggml_add(ctx,
+            ggml_mul(ctx, experts_hot, mask_3d),
+            ggml_mul(ctx, experts_cold, cmask_3d));
+        cb(experts, "ffn_moe_down", il);
+    } else {
+    // Original non-hotset path
     // For now we don't modify the fused up/gate op to include biases.
     // Hence, if we have biases, we cannot use fmoe.
     //
@@ -1236,12 +1286,13 @@ llm_expert_gating_func_type   gating_op,
     }
     cb(par, "ffn_moe_gate_par", il);
 
-    ggml_tensor * experts = llm_build_lora_mm_id(lctx, ctx, down_exps, par, selected_experts); // [n_embd, n_expert_used, n_tokens]
+    experts = llm_build_lora_mm_id(lctx, ctx, down_exps, par, selected_experts); // [n_embd, n_expert_used, n_tokens]
     cb(experts, "ffn_moe_down", il);
 
     if (down_exps_b) {
         experts = ggml_add_id(ctx, experts, down_exps_b, selected_experts);
         cb(experts, "ffn_moe_down_biased", il);
+    }
     }
 
     if (down_exps_s && !lctx.cparams.fused_mmad) {
