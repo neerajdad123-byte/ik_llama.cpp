@@ -367,6 +367,8 @@ struct gpt_params {
 
     std::vector<llama_control_vector_load_info> control_vectors; // control vector with user defined scale
 
+    std::string hotset_file               = ""; // file containing hot expert indices per layer
+
     int32_t verbosity                  = 0;
     int32_t control_vector_layer_start = -1; // layer range for control vector
     int32_t control_vector_layer_end   = -1; // layer range for control vector

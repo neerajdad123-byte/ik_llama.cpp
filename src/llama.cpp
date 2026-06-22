@@ -101,6 +101,7 @@ void llama_set_mtp_target_context(struct llama_context * ctx, struct llama_conte
 #include <cstring>
 #include <ctime>
 #include <fstream>
+#include <nlohmann/json.hpp>
 #include <functional>
 #include <future>
 #include <initializer_list>
@@ -3361,6 +3362,7 @@ static bool llm_load_tensors(
         bool mtp,
         bool fit,
         bool dry_run,
+        const char * hotset_file,
         llama_progress_callback progress_callback,
         void * progress_callback_user_data) {
     model.t_start_us = ggml_time_us();
@@ -3800,6 +3802,47 @@ static bool llm_load_tensors(
         }
     }
 
+    // Apply hotset if specified — per-expert GPU/CPU split at load time
+    if (hotset_file && hotset_file[0]) {
+        LLAMA_LOG_INFO("%s: loading hotset from %s\n", __func__, hotset_file);
+        std::ifstream hotset_fs(hotset_file);
+        if (!hotset_fs.is_open()) {
+            throw std::runtime_error(std::string("Unable to open hotset file: ") + hotset_file);
+        }
+        nlohmann::json hotset_json;
+        try { hotset_fs >> hotset_json; }
+        catch (const std::exception &e) {
+            throw std::runtime_error("Failed to parse hotset JSON: " + std::string(e.what()));
+        }
+
+        int total_hot = 0, total_layers_with_hot = 0;
+        for (int il = 0; il < n_layer; ++il) {
+            auto & layer = model.layers[il];
+            if (hotset_json.contains(std::to_string(il))) {
+                auto & arr = hotset_json[std::to_string(il)];
+                layer.hotset_hot_indices.clear();
+                for (auto & v : arr) {
+                    layer.hotset_hot_indices.push_back(v.get<int>());
+                }
+                std::sort(layer.hotset_hot_indices.begin(), layer.hotset_hot_indices.end());
+                total_hot += (int)layer.hotset_hot_indices.size();
+                total_layers_with_hot++;
+            }
+        }
+        LLAMA_LOG_INFO("%s: hotset: %d layers, %d total hot expert slots\n", __func__, total_layers_with_hot, total_hot);
+
+        // Force fused expert tensors to CPU for hotset layers (we'll split hot experts to GPU later)
+        auto buft_ram = llama_default_buffer_type_cpu(true);
+        for (int il = 0; il < n_layer; ++il) {
+            if (model.layers[il].hotset_hot_indices.empty()) continue;
+            for (const char *et : {"ffn_gate_exps", "ffn_up_exps", "ffn_down_exps"}) {
+                auto &o = overrides.emplace_back();
+                o.pattern = strdup(("blk\\." + std::to_string(il) + "\\." + et + "\\.weight").c_str());
+                o.buft = buft_ram;
+            }
+        }
+    }
+
     if (!overrides.empty()) {
         auto & last = overrides.emplace_back();
         last.pattern = nullptr;
@@ -3938,6 +3981,76 @@ static bool llm_load_tensors(
         ctx_bufs.emplace_back(ctx, bufs);
     }
 
+    // Check if hotset is active
+    bool has_hotset = false;
+    for (int il = 0; il < n_layer; ++il) {
+        if (!model.layers[il].hotset_hot_indices.empty()) { has_hotset = true; break; }
+    }
+
+    // Create hot GPU sub-tensors for hotset (after buffer alloc, before data loading)
+    if (has_hotset && n_expert > 0) {
+        auto buft_vram = llama_default_buffer_type_offload(model, main_gpu);
+
+        // Compute memory needed for hot tensor metadata
+        size_t hot_mem_size = 4096; // overhead for ggml_context
+        int n_hot_total = 0;
+        for (int il = 0; il < n_layer; ++il) {
+            auto & layer = model.layers[il];
+            int n_hot = (int)layer.hotset_hot_indices.size();
+            if (n_hot == 0) continue;
+            n_hot_total += n_hot;
+            for (auto * t : {layer.ffn_gate_exps, layer.ffn_up_exps, layer.ffn_down_exps}) {
+                if (t) hot_mem_size += ggml_tensor_overhead();
+            }
+        }
+
+        // Create a new ggml_context for hot GPU sub-tensors
+        ggml_init_params hot_params = { .mem_size = hot_mem_size, .mem_buffer = NULL, .no_alloc = true };
+        ggml_context * hot_ctx = ggml_init(hot_params);
+        if (!hot_ctx) {
+            throw std::runtime_error("Failed to create ggml context for hotset tensors");
+        }
+        model.ctxs.emplace_back(hot_ctx);
+
+        // Create hot sub-tensors
+        auto make_hot_name = [](int il, const char * type) {
+            return "hotset." + std::to_string(il) + "." + type + ".weight";
+        };
+        for (int il = 0; il < n_layer; ++il) {
+            auto & layer = model.layers[il];
+            int n_hot = (int)layer.hotset_hot_indices.size();
+            if (n_hot == 0) continue;
+
+            if (layer.ffn_gate_exps) {
+                layer.ffn_gate_exps_hot = ggml_new_tensor_3d(hot_ctx,
+                    layer.ffn_gate_exps->type, layer.ffn_gate_exps->ne[0], layer.ffn_gate_exps->ne[1], n_hot);
+                ggml_set_name(layer.ffn_gate_exps_hot, make_hot_name(il, "ffn_gate_exps_hot").c_str());
+            }
+            if (layer.ffn_up_exps) {
+                layer.ffn_up_exps_hot = ggml_new_tensor_3d(hot_ctx,
+                    layer.ffn_up_exps->type, layer.ffn_up_exps->ne[0], layer.ffn_up_exps->ne[1], n_hot);
+                ggml_set_name(layer.ffn_up_exps_hot, make_hot_name(il, "ffn_up_exps_hot").c_str());
+            }
+            if (layer.ffn_down_exps) {
+                layer.ffn_down_exps_hot = ggml_new_tensor_3d(hot_ctx,
+                    layer.ffn_down_exps->type, layer.ffn_down_exps->ne[0], layer.ffn_down_exps->ne[1], n_hot);
+                ggml_set_name(layer.ffn_down_exps_hot, make_hot_name(il, "ffn_down_exps_hot").c_str());
+            }
+        }
+
+        // Allocate GPU buffer for hot tensors
+        ggml_backend_buffer_t hot_buf = ggml_backend_alloc_ctx_tensors_from_buft(hot_ctx, buft_vram);
+        if (!hot_buf) {
+            throw std::runtime_error("Failed to allocate GPU buffer for hotset tensors");
+        }
+        ggml_backend_buffer_set_usage(hot_buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+        model.bufs.push_back(hot_buf);
+
+        LLAMA_LOG_INFO("%s: created hotset GPU buffer (%s, %s)\n", __func__,
+            ggml_backend_buffer_name(hot_buf),
+            ggml_backend_buft_name(buft_vram));
+    }
+
     if (llama_supports_gpu_offload()) {
         const int n_gpu = std::min(n_gpu_layers, int(hparams.n_layer));
 
@@ -3977,6 +4090,33 @@ static bool llm_load_tensors(
         if (defer_expert_mmap) {
             ml.drop_mmap_expert_pages();
         }
+    }
+
+    // Copy hot expert data from CPU fused tensors to GPU hot sub-tensors
+    if (has_hotset && n_expert > 0 && !dry_run) {
+        int n_copied = 0;
+        for (int il = 0; il < n_layer; ++il) {
+            auto & layer = model.layers[il];
+            int n_hot = (int)layer.hotset_hot_indices.size();
+            if (n_hot == 0) continue;
+
+            auto copy_hot_experts = [&](ggml_tensor * src, ggml_tensor * dst) {
+                if (!src || !dst) return;
+                size_t exp_stride = (size_t)src->nb[2]; // bytes between consecutive experts
+                for (int h = 0; h < n_hot; h++) {
+                    int src_exp = layer.hotset_hot_indices[h];
+                    ggml_backend_tensor_set(dst,
+                        (char*)src->data + src_exp * exp_stride,
+                        (size_t)h * exp_stride, exp_stride);
+                    n_copied++;
+                }
+            };
+
+            copy_hot_experts(layer.ffn_gate_exps, layer.ffn_gate_exps_hot);
+            copy_hot_experts(layer.ffn_up_exps,   layer.ffn_up_exps_hot);
+            copy_hot_experts(layer.ffn_down_exps, layer.ffn_down_exps_hot);
+        }
+        LLAMA_LOG_INFO("%s: hotset: copied %d hot expert shards to GPU\n", __func__, n_copied);
     }
 
     if (model.is_mla_model()) {
@@ -4154,6 +4294,7 @@ static int llama_model_load(const std::string & fname, llama_model & model, llam
             params.max_ctx_size, params.n_seq_max, params.n_ubatch, params.amb, params.fit_margin, params.fit_margin_array,
             params.worst_graph_tokens, params.flash_attn,
             params.use_mlock, params.validate_quants, params.mtp, params.fit, params.dry_run,
+            params.hotset_file,
             params.progress_callback, params.progress_callback_user_data
         )) {
             return -2;
@@ -6439,6 +6580,7 @@ struct llama_model_params llama_model_default_params() {
         /*.dry_run                     =*/ false,
         /*.flash_attn                  =*/ true,
         /*.defer_experts               =*/ false,
+        /*.hotset_file                 =*/ nullptr,
     };
 
 #ifdef GGML_USE_METAL

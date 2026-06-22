@@ -2103,6 +2103,11 @@ bool gpt_params_find_arg(int argc, char ** argv, const std::string & arg, gpt_pa
         //}
         return true;
     }
+    if (arg == "--hotset-file") {
+        CHECK_ARG
+        params.hotset_file = argv[i];
+        return true;
+    }
     if (arg == "--fit") {
         params.fit = true;
         return true;
@@ -3207,6 +3212,7 @@ void gpt_params_print_usage(int /*argc*/, char ** argv, const gpt_params & param
     options.push_back({ "*",           "       --run-time-repack",      "repack tensors if interleaved variant is available"});
     options.push_back({ "*",           "       --cpu-moe",              "keep all MoE weights in CPU memory"});
     options.push_back({ "*",           "       --n-cpu-moe N",          "keep MoE weights of the first N layers in CPU memory"});
+    options.push_back({ "*",           "       --hotset-file FILE",    "pin hot experts from FILE to VRAM, rest to CPU"});
     options.push_back({ "*",           "       --defer-experts",        "defer expert mmap residency on Linux to reduce model load time"});
     options.push_back({ "*",           "       --fit-margin N",         "safety margin in MiB when auto-fitting model offloading"});
     options.push_back({ "*",           "-wgt, --worst-graph-tokens N",  "number of tokens to use for worst-case graph"});
@@ -4180,6 +4186,8 @@ struct llama_model_params common_model_params_to_llama(const gpt_params & params
         GGML_ASSERT(params.fit_margin_array[params.fit_margin_array.size()-2] == -1 && "Fit margin array is not correctly termionated");
         mparams.fit_margin_array = params.fit_margin_array.data();
     }
+
+    mparams.hotset_file = params.hotset_file.empty() ? nullptr : params.hotset_file.c_str();
 
     return mparams;
 }
